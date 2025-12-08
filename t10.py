@@ -117,15 +117,52 @@ class TextDataset(Dataset):
 
 def compute_bert_embeddings(desc_df):
     if not BERT_AVAILABLE or not Config.USE_BERT: return {}
+
+    # КЭШ: Если файл есть, грузим его. Если переименовал в прошлый раз - используй то имя.
     cache_path = Config.PROCESSED_DATA_DIR / "bert_embeddings_full.pkl"
     if cache_path.exists():
         print("Loading cached BERT embeddings...")
         return joblib.load(cache_path)
 
-    # ... (код вычисления BERT опущен, он такой же как в v5, берется из кэша) ...
-    # Если кэша нет - скопируй функцию из v5 полностью, но я предполагаю кэш есть.
-    print("Warning: Cache not found, please ensure bert_embeddings_full.pkl exists from previous run to save time!")
-    return {}
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Running BERT on {device}")
+
+    tokenizer = AutoTokenizer.from_pretrained(Config.BERT_MODEL_NAME)
+    model = AutoModel.from_pretrained(Config.BERT_MODEL_NAME).to(device)
+    model.eval()
+
+    unique_books = desc_df[[Constants.COL_BOOK_ID, Constants.COL_DESCRIPTION]].drop_duplicates(
+        subset=Constants.COL_BOOK_ID)
+    unique_books[Constants.COL_DESCRIPTION] = unique_books[Constants.COL_DESCRIPTION].fillna("").astype(str)
+
+    dataset = TextDataset(unique_books[Constants.COL_DESCRIPTION].values, unique_books[Constants.COL_BOOK_ID].values,
+                          tokenizer, Config.BERT_MAX_LEN)
+    loader = DataLoader(dataset, batch_size=Config.BERT_BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=True)
+
+    embeddings = {}
+    print("Computing BERT embeddings...")
+    with torch.no_grad():
+        for batch in tqdm(loader):
+            input_ids = batch['input_ids'].to(device)
+            mask = batch['attention_mask'].to(device)
+            b_ids = batch['book_id'].numpy()
+            with torch.cuda.amp.autocast():
+                out = model(input_ids=input_ids, attention_mask=mask)
+                token_emb = out.last_hidden_state
+                # Mean Pooling
+                input_mask_expanded = mask.unsqueeze(-1).expand(token_emb.size()).float()
+                sum_emb = torch.sum(token_emb * input_mask_expanded, 1)
+                sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+                mean_emb = (sum_emb / sum_mask).float().cpu().numpy()
+            for bid, emb in zip(b_ids, mean_emb):
+                embeddings[bid] = emb
+
+    joblib.dump(embeddings, cache_path)
+    return embeddings
+
+
+
+
 
 
 # --- SVD (Copy from v5) ---
@@ -501,4 +538,5 @@ def main():
 
 
 if __name__ == "__main__":
+
     main()
